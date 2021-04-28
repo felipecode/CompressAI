@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import argparse
+import os
 import math
 import random
 import shutil
 import sys
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -27,30 +30,41 @@ from torchvision import transforms
 
 from compressai.datasets import ImageFolder
 from compressai.layers import GDN
-from compressai.models import CompressionModel
+from compressai.models import MeanScaleHyperprior
 from compressai.models.utils import conv, deconv
+from compressai.utils.writer import get_writer
 
+def psnr(mse):
+    if torch.is_tensor(mse):
+        log10 = torch.log10
+    else:
+        log10 = np.log10
+    return 10 * log10(1 / mse)
 
-class AutoEncoder(CompressionModel):
+class AutoEncoder(MeanScaleHyperprior):
     """Simple autoencoder with a factorized prior """
 
-    def __init__(self, N=128):
-        super().__init__(entropy_bottleneck_channels=N)
+    def __init__(self, C=256):
+        super().__init__(N=256, M=C)
 
         self.encode = nn.Sequential(
-            conv(3, N, kernel_size=9, stride=4),
-            GDN(N),
-            conv(N, N),
-            GDN(N),
-            conv(N, N),
+            nn.Conv2d(in_channels=3, out_channels=C, kernel_size=5, stride=2, padding=2),
+            GDN(C),
+            nn.Conv2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2),
+            GDN(C),
+            nn.Conv2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2),
+            GDN(C),
+            nn.Conv2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2),
         )
 
         self.decode = nn.Sequential(
-            deconv(N, N),
-            GDN(N, inverse=True),
-            deconv(N, N),
-            GDN(N, inverse=True),
-            deconv(N, 3, kernel_size=9, stride=4),
+            nn.ConvTranspose2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2, output_padding=1),
+            GDN(C, inverse=True),
+            nn.ConvTranspose2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2, output_padding=1),
+            GDN(C, inverse=True),
+            nn.ConvTranspose2d(in_channels=C, out_channels=C, kernel_size=5, stride=2, padding=2, output_padding=1),
+            GDN(C, inverse=True),
+            nn.ConvTranspose2d(in_channels=C, out_channels=3, kernel_size=5, stride=2, padding=2, output_padding=1),
         )
 
     def forward(self, x):
@@ -145,7 +159,7 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, writer
 ):
     model.train()
     device = next(model.parameters()).device
@@ -164,9 +178,14 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
+
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
+        writer.write_metric("psnr", psnr(out_criterion["mse_loss"].item()), int(i+ epoch*(len(train_dataloader.dataset)/train_dataloader.batch_size)))
+        writer.write_metric("mse", out_criterion["mse_loss"].item(), int(i+ epoch*(len(train_dataloader.dataset)/train_dataloader.batch_size)))
+        writer.write_metric(f"bpp", out_criterion["bpp_loss"].item(),int( i+ epoch*(len(train_dataloader.dataset)/train_dataloader.batch_size)))
+        writer.write_metric(f"aux loss", aux_loss.item(), int(i+ epoch*(len(train_dataloader.dataset)/train_dataloader.batch_size)))
 
         if i % 10 == 0:
             print(
@@ -175,12 +194,14 @@ def train_one_epoch(
                 f" ({100. * i / len(train_dataloader):.0f}%)]"
                 f'\tLoss: {out_criterion["loss"].item():.3f} |'
                 f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
+                f'\tPSNR loss: {psnr(out_criterion["mse_loss"].item()):.3f} |'
                 f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                 f"\tAux loss: {aux_loss.item():.2f}"
             )
+    return int(i+ epoch*(len(train_dataloader.dataset)/train_dataloader.batch_size))
 
 
-def test_epoch(epoch, test_dataloader, model, criterion):
+def test_epoch(epoch, test_dataloader, model, criterion, writer, last_iteration):
     model.eval()
     device = next(model.parameters()).device
 
@@ -199,6 +220,11 @@ def test_epoch(epoch, test_dataloader, model, criterion):
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+
+    writer.write_metric("val/psnr", psnr(mse_loss.avg),last_iteration)
+    writer.write_metric("val/mse", mse_loss.avg, last_iteration)
+    writer.write_metric(f"val/bpp",bpp_loss.avg, last_iteration)
+    writer.write_metric(f"val/aux loss", aux_loss.avg, last_iteration)
 
     print(
         f"Test epoch {epoch}: Average losses:"
@@ -268,8 +294,12 @@ def parse_args(argv):
         '--patch-size',
         type=int,
         nargs=2,
-        default=(256, 256),
+        default=(64, 64),
         help='Size of the patches to be cropped (default: %(default)s)')
+    parser.add_argument(
+        '--experiment',
+        '-exp',
+        help='The experiment path')
     parser.add_argument(
         '--cuda',
         action='store_true',
@@ -305,7 +335,7 @@ def main(argv):
     test_transforms = transforms.Compose(
         [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
     )
-
+    print ("INdexing image folder \n")
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
@@ -316,6 +346,10 @@ def main(argv):
         shuffle=True,
         pin_memory=True,
     )
+    if not os.path.exists('_logs'):
+        os.mkdir('_logs')
+    if not os.path.exists(os.path.join('_logs',args.experiment)):
+        os.mkdir(os.path.join('_logs',args.experiment))
 
     test_dataloader = DataLoader(
         test_dataset,
@@ -333,13 +367,13 @@ def main(argv):
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
+    writer = get_writer(True, experiment_path=os.path.join('_logs',args.experiment), config=vars(args), dummy=False)
     optimizer, aux_optimizer = configure_optimizers(net, args)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     best_loss = 1e10
     for epoch in range(args.epochs):
-        print ("training the first epoch ")
-        train_one_epoch(
+        last_iteration = train_one_epoch(
             net,
             criterion,
             train_dataloader,
@@ -347,8 +381,11 @@ def main(argv):
             aux_optimizer,
             epoch,
             args.clip_max_norm,
+            writer
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
+
+        loss = test_epoch(epoch, test_dataloader, net, criterion, writer, last_iteration)
+
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
         if args.save:
@@ -360,7 +397,7 @@ def main(argv):
                     "optimizer": optimizer.state_dict(),
                     "aux_optimizer": aux_optimizer.state_dict(),
                 },
-                is_best,
+                is_best, filename=os.path.join(os.path.join('_logs',args.experiment,'checkpoint'))
             )
 
 

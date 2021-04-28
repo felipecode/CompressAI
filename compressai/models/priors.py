@@ -61,6 +61,7 @@ class CompressionModel(nn.Module):
         aux_loss = sum(
             m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
         )
+        print (" AUX LOSS ", aux_loss)
         return aux_loss
 
     def _initialize_weights(self):
@@ -444,7 +445,7 @@ class JointAutoregressiveHierarchicalPriors(MeanScaleHyperprior):
 
         self.context_prediction = MaskedConv2d(
             M, 2 * M, kernel_size=5, padding=2, stride=1
-        )
+        ) # just a masked conv that will try to find features inside.
 
         self.gaussian_conditional = GaussianConditional(None)
         self.N = int(N)
@@ -455,6 +456,7 @@ class JointAutoregressiveHierarchicalPriors(MeanScaleHyperprior):
         return 2 ** (4 + 2)
 
     def forward(self, x):
+
         y = self.g_a(x)
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
@@ -468,6 +470,8 @@ class JointAutoregressiveHierarchicalPriors(MeanScaleHyperprior):
             torch.cat((params, ctx_params), dim=1)
         )
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        print (scales_hat.shape)
+        print (means_hat.shape)
         _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
         x_hat = self.g_s(y_hat)
 

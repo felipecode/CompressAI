@@ -414,6 +414,10 @@ class EntropyBottleneck(EntropyModel):
         upper = self._logits_cumulative(v1, stop_gradient=False)
         sign = -torch.sign(lower + upper)
         sign = sign.detach()
+        print (" SIGN UPPER \n")
+        print (torch.sigmoid(sign * upper))
+        print (" SIGN LOWER \n")
+        print (torch.sigmoid(sign * lower))
         likelihood = torch.abs(
             torch.sigmoid(sign * upper) - torch.sigmoid(sign * lower)
         )
@@ -570,7 +574,6 @@ class GaussianConditional(EntropyModel):
         else:
             values = inputs
 
-        scales = self.lower_bound_scale(scales)
 
         values = torch.abs(values)
         upper = self._standardized_cumulative((half - values) / scales)
